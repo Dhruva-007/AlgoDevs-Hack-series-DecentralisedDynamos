@@ -12,10 +12,9 @@ import { useWallet } from "@txnlab/use-wallet-react"
 // Base navigation items always visible
 const baseNavigationItems = [
   { name: "Open Source", href: "/open" },
+  { name: "Learn", href: "/learn" },
   { name: "ARCs", href: "/ARCs" },
   { name: "Docs", href: "/docs" },
-  { name: "Leaderboard", href: "/leaderboard" },
-
 ]
 
 // Navigation items only visible when wallet is connected
@@ -46,12 +45,7 @@ export function Header() {
             <SheetContent side="left" className="w-[300px] bg-[#0c0909] border-white/20">
               <div className="flex flex-col space-y-6">
                 <Link href="/" className="flex items-center space-x-2">
-                <img
-              src="logo.png"
-              alt="Algorand Devs Logo"
-              className="h-12 w-auto mr-[-5]"
-            />
-                  <span className="text-xl font-bold text-white">Devs</span>
+                  <span className="text-xl font-bold text-white">AlgoDevs</span>
                 </Link>
                 <nav className="flex flex-col space-y-4">
                   {navigationItems.map((item) => (
@@ -77,12 +71,7 @@ export function Header() {
           </Sheet>
 
           <Link href="/" className="flex items-center space-x-2 group">
-          <img
-              src="logo.png"
-              alt="Algorand Events Logo"
-              className="h-12 w-auto mr-[-5]"
-            />
-            <span className="text-2xl font-bold text-white transition-all tracking-wider">Devs</span>
+            <span className="text-2xl font-bold text-white transition-all tracking-wider">AlgoDevs</span>
           </Link>
         </div>
 

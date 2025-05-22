@@ -8,26 +8,34 @@ import { Badge } from "@/components/ui/badge"
 import { Star, Clock, Users, Search, Plus, Loader2, Filter } from "lucide-react"
 import { useWallet } from "@txnlab/use-wallet-react"
 import { Input } from "@/components/ui/input"
-import { createClient } from "@supabase/supabase-js"
-import { toast } from "sonner"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-
-// Initialize Supabase client
-const supabase =
-  process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-    ? createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY)
-    : null
+import algosdk from "algosdk"
+import Image from "next/image"
 
 // Bounty categories
 const bountyCategories = ["Development", "Design", "Content", "Community", "Marketing", "Research", "Testing", "Other"]
 
-// Define the Bounty type
+// Define the BountyConfig type to match the blockchain structure
+interface BountyConfig {
+  bountyId: bigint
+  bountyName: string
+  bountyCategory: string
+  bountyDescription: string
+  bountyCreator: string
+  bountyImage: string
+  bountyCost: bigint
+  endTime: bigint
+  submissionCount: bigint
+  bountyAppId: bigint
+}
+
+// Define the UI Bounty type
 interface Bounty {
   id: string
   title: string
-  description: string
-  organization: string
+  description?: string
+  organization?: string
   reward: number
   duein: string
   duedate: string
@@ -38,6 +46,15 @@ interface Bounty {
   requirements?: string
   creatoraddress: string
   created_at: string
+  image?: string
+  appId: number
+}
+
+// Debug info type
+interface DebugInfo {
+  appId: number
+  boxCount: number
+  timestamp: string
 }
 
 export default function BountiesPage() {
@@ -53,89 +70,189 @@ export default function BountiesPage() {
     totalValue: 0,
     totalBounties: 0,
   })
+  const [error, setError] = useState<string | null>(null)
+  const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null)
 
   useEffect(() => {
-    fetchBounties()
-    fetchStats()
+    fetchBountiesFromBlockchain()
   }, [activeTab, selectedCategory])
 
-  async function fetchStats() {
-    try {
-      if (!supabase) {
-        toast.error("Database connection not available")
-        return
-      }
-
-      // Get total bounties count
-      const { count: totalBounties } = await supabase.from("bounties").select("*", { count: "exact", head: true })
-
-      // Get sum of all rewards
-      const { data: rewardData } = await supabase.from("bounties").select("reward")
-
-      const totalValue = rewardData?.reduce((sum, item) => sum + (Number(item.reward) || 0), 0) || 0
-
-      setStats({
-        totalValue,
-        totalBounties: totalBounties || 0,
-      })
-    } catch (error) {
-      console.error("Error fetching stats:", error)
-      toast.error("Failed to fetch bounty statistics")
-    }
-  }
-
-  async function fetchBounties() {
+  async function fetchBountiesFromBlockchain() {
     setLoading(true)
+    setError(null)
     try {
-      if (!supabase) {
-        toast.error("Database connection not available")
+      const indexer = new algosdk.Indexer("", "https://testnet-idx.algonode.cloud", "")
+      const appId = 739937829 // Bounty Manager App ID
+
+      // Define ABI type for bounty data
+      const abiType = algosdk.ABIType.from("(uint64,string,string,string,address,string,uint64,uint64,uint64,uint64)")
+
+      // Search for application boxes
+      const boxesResp = await indexer.searchForApplicationBoxes(appId).do()
+      console.log("Boxes response:", boxesResp)
+
+      // Store debug info
+      setDebugInfo({
+        appId,
+        boxCount: boxesResp.boxes.length,
+        timestamp: new Date().toISOString(),
+      })
+
+      if (!boxesResp.boxes || boxesResp.boxes.length === 0) {
+        setError("No bounties found in the blockchain. The application may not have any bounties yet.")
+        setBounties([])
+        setStats({
+          totalValue: 0,
+          totalBounties: 0,
+        })
         setLoading(false)
         return
       }
 
-      let query = supabase.from("bounties").select("*")
+      const fetchedBounties: Bounty[] = []
+      let totalValue = 0
 
-      // Apply status filter based on active tab
-      if (activeTab === "open") {
-        query = query.eq("status", "active")
-      } else if (activeTab === "in-review") {
-        query = query.eq("status", "in-review")
-      } else if (activeTab === "completed") {
-        query = query.eq("status", "completed")
+      for (const box of boxesResp.boxes) {
+        try {
+          // Decode box.name
+          const nameBuf =
+            typeof box.name === "string"
+              ? Buffer.from(box.name, "base64")
+              : Buffer.from(
+                  (box.name as Uint8Array).buffer,
+                  (box.name as Uint8Array).byteOffset,
+                  (box.name as Uint8Array).byteLength,
+                )
+
+          // Fetch box value
+          const valResp = await indexer
+            .lookupApplicationBoxByIDandName(
+              appId,
+              new Uint8Array(nameBuf.buffer, nameBuf.byteOffset, nameBuf.byteLength),
+            )
+            .do()
+
+          // Normalize to Buffer
+          let buf: Buffer
+          if (typeof valResp.value === "string") {
+            buf = Buffer.from(valResp.value, "base64")
+          } else {
+            const u8 = valResp.value as Uint8Array
+            buf = Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength)
+          }
+
+          // ABI Decode with bounty structure
+          const decodedTuple = abiType.decode(buf) as [
+            bigint, // 0: BountyID
+            string, // 1: BountyName
+            string, // 2: BountyCategory
+            string, // 3: BountyDescription
+            string, // 4: BountyCreator (address)
+            string, // 5: BountyImage
+            bigint, // 6: BountyCost
+            bigint, // 7: EndTime
+            bigint, // 8: SubmissionCount
+            bigint, // 9: BountyAppID
+          ]
+
+          // Map to BountyConfig
+          const bountyConfig: BountyConfig = {
+            bountyId: decodedTuple[0],
+            bountyName: decodedTuple[1],
+            bountyCategory: decodedTuple[2],
+            bountyDescription: decodedTuple[3],
+            bountyCreator: decodedTuple[4],
+            bountyImage: decodedTuple[5],
+            bountyCost: decodedTuple[6],
+            endTime: decodedTuple[7],
+            submissionCount: decodedTuple[8],
+            bountyAppId: decodedTuple[9],
+          }
+
+          console.log("Decoded bounty:", bountyConfig)
+
+          // Calculate due date and "due in" string
+          const endTimeDate = new Date(Number(bountyConfig.endTime) * 1000)
+          const now = new Date()
+          const diffTime = endTimeDate.getTime() - now.getTime()
+          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
+          const dueIn = diffDays <= 0 ? "Expired" : `${diffDays}d`
+
+          // Determine status based on end time and submission count
+          let status: "active" | "in-review" | "completed" = "active"
+          if (diffDays <= 0) {
+            status = "completed"
+          } else if (Number(bountyConfig.submissionCount) > 0) {
+            status = "in-review"
+          }
+
+          // Skip if not matching the selected tab
+          if (
+            (activeTab === "open" && status !== "active") ||
+            (activeTab === "in-review" && status !== "in-review") ||
+            (activeTab === "completed" && status !== "completed")
+          ) {
+            continue
+          }
+
+          // Skip if not matching the selected category
+          if (selectedCategory && bountyConfig.bountyCategory !== selectedCategory) {
+            continue
+          }
+
+          // Skip if not matching the search term
+          if (searchTerm && !bountyConfig.bountyName.toLowerCase().includes(searchTerm.toLowerCase())) {
+            continue
+          }
+
+          // Convert to UI Bounty format
+          const uiBounty: Bounty = {
+            id: bountyConfig.bountyId.toString(),
+            title: bountyConfig.bountyName,
+            description: bountyConfig.bountyDescription, // Use the actual description from blockchain
+            organization: "", // We don't have this in the blockchain data
+            reward: Number(bountyConfig.bountyCost),
+            duein: dueIn,
+            duedate: endTimeDate.toISOString(),
+            participants: Number(bountyConfig.submissionCount),
+            featured: false, // We don't have this in the blockchain data
+            status: status,
+            category: bountyConfig.bountyCategory,
+            creatoraddress: bountyConfig.bountyCreator,
+            created_at: new Date().toISOString(), // We don't have creation time in the blockchain data
+            image: bountyConfig.bountyImage,
+            appId: Number(bountyConfig.bountyAppId),
+          }
+
+          fetchedBounties.push(uiBounty)
+          totalValue += Number(bountyConfig.bountyCost)
+        } catch (err) {
+          console.error("Error processing bounty box:", err)
+          // Continue with other boxes
+        }
       }
 
-      // Apply search filter if provided
-      if (searchTerm) {
-        query = query.or(
-          `title.ilike.%${searchTerm}%,description.ilike.%${searchTerm}%,organization.ilike.%${searchTerm}%`,
-        )
-      }
-
-      // Apply category filter if selected
-      if (selectedCategory) {
-        query = query.eq("category", selectedCategory)
-      }
-
-      const { data, error } = await query
-        .order("featured", { ascending: false })
-        .order("created_at", { ascending: false })
-
-      if (error) throw error
-      setBounties(data || [])
-    } catch (error) {
-      console.error("Error fetching bounties:", error)
-      toast.error("Failed to fetch bounties")
+      // Update state with fetched bounties
+      setBounties(fetchedBounties)
+      setStats({
+        totalValue,
+        totalBounties: fetchedBounties.length,
+      })
+    } catch (err) {
+      console.error("Error fetching bounties from blockchain:", err)
+      setError("Failed to fetch bounties from the blockchain. Please try again later.")
+      setBounties([])
     } finally {
       setLoading(false)
     }
   }
 
   const handleSearch = () => {
-    fetchBounties()
+    fetchBountiesFromBlockchain()
   }
 
-  const navigateToBounty = (id: string) => {
-    router.push(`/bounty/${id}`)
+  const navigateToBounty = (id: string, appId: number) => {
+    router.push(`/bounty/${appId}`)
   }
 
   const formatAlgoAmount = (amount: number | string) => {
@@ -163,7 +280,7 @@ export default function BountiesPage() {
             <div className="flex-1 relative">
               <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-indigo-300 h-5 w-5" />
               <Input
-                placeholder="Search bounties by title, description, or organization..."
+                placeholder="Search bounties by title..."
                 className="pl-10 bg-black/30 border-indigo-400/20 text-white h-12 rounded-lg"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
@@ -249,6 +366,14 @@ export default function BountiesPage() {
             {renderBountyList()}
           </TabsContent>
         </Tabs>
+
+        {/* Debug Info (only in development) */}
+        {process.env.NODE_ENV === "development" && debugInfo && (
+          <div className="mt-8 p-4 bg-gray-800 rounded-lg text-xs text-gray-300">
+            <h4 className="font-mono mb-2">Debug Info:</h4>
+            <pre>{JSON.stringify(debugInfo, null, 2)}</pre>
+          </div>
+        )}
       </div>
     </main>
   )
@@ -258,6 +383,19 @@ export default function BountiesPage() {
       return (
         <div className="flex justify-center items-center py-12">
           <Loader2 className="h-8 w-8 text-indigo-500 animate-spin" />
+        </div>
+      )
+    }
+
+    if (error) {
+      return (
+        <div className="bg-black/30 rounded-xl border border-red-400/20 p-10 text-center">
+          <h3 className="text-xl font-medium text-white mb-2">Error Loading Bounties</h3>
+          <p className="text-red-400 mb-6">{error}</p>
+          <Button onClick={fetchBountiesFromBlockchain} className="bg-indigo-600 hover:bg-indigo-700 text-white">
+            <Loader2 className="h-4 w-4 mr-2" />
+            Retry
+          </Button>
         </div>
       )
     }
@@ -285,16 +423,35 @@ export default function BountiesPage() {
           <Card
             key={bounty.id}
             className="bg-black/40 border-indigo-400/20 hover:border-indigo-400/50 transition-all overflow-hidden cursor-pointer"
-            onClick={() => navigateToBounty(bounty.id)}
+            onClick={() => navigateToBounty(bounty.id, bounty.appId)}
           >
             <div className="p-6">
               <div className="flex flex-col md:flex-row md:items-start justify-between gap-4">
-                <div className="flex-1">
+                {bounty.image && (
+                  <div className="md:w-1/4 mb-4 md:mb-0">
+                    <div className="relative aspect-video w-full overflow-hidden rounded-lg">
+                      <Image
+                        src={bounty.image || "/placeholder.svg"}
+                        alt={bounty.title}
+                        fill
+                        className="object-cover"
+                        onError={(e) => {
+                          // Fallback if image fails to load
+                          const target = e.target as HTMLImageElement
+                          target.src = "/treasure-chest-overflowing.png"
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div className={`flex-1 ${bounty.image ? "md:w-3/4" : "w-full"}`}>
                   <h3 className="text-xl font-bold text-white mb-2 group-hover:text-indigo-300 transition-colors">
                     {bounty.title}
                   </h3>
-                  <p className="text-gray-300 mb-4">{bounty.organization}</p>
-                  <div className="flex flex-wrap items-center gap-3">
+                  {bounty.description && <p className="text-gray-300 mb-4 line-clamp-2">{bounty.description}</p>}
+                  {bounty.organization && <p className="text-gray-300 mb-4">{bounty.organization}</p>}
+                  <div className="flex flex-wrap items-center gap-3 mb-4">
                     <Badge variant="outline" className="bg-indigo-600/20 text-white border-indigo-400/30">
                       {bounty.category}
                     </Badge>
@@ -304,7 +461,7 @@ export default function BountiesPage() {
                     </div>
                     <div className="flex items-center gap-2 text-indigo-300">
                       <Users className="h-4 w-4" />
-                      <span>{bounty.participants}</span>
+                      <span>{bounty.participants} submissions</span>
                     </div>
                     {bounty.featured && (
                       <div className="flex items-center gap-2 text-yellow-500">
@@ -314,46 +471,43 @@ export default function BountiesPage() {
                     )}
                   </div>
 
-                  {bounty.requirements && (
-                    <div className="mt-4 bg-indigo-500/10 p-3 rounded-md">
-                      <h4 className="text-sm font-medium text-indigo-300 mb-1">Requirements:</h4>
-                      <p className="text-sm text-gray-300">{bounty.requirements}</p>
+                  <div className="flex flex-col md:flex-row md:items-center justify-between">
+                    <div className="mb-4 md:mb-0">
+                      <p className="text-xl font-bold text-white">{formatAlgoAmount(bounty.reward)}</p>
+                      <p className="text-sm text-gray-400">App ID: {bounty.appId}</p>
                     </div>
-                  )}
-                </div>
 
-                <div className="flex flex-col items-end justify-between h-full">
-                  <div className="text-right mb-4 md:mb-0">
-                    <p className="text-xl font-bold text-white mb-2">{formatAlgoAmount(bounty.reward)}</p>
-                    <Badge
-                      variant="secondary"
-                      className={
-                        bounty.status === "active"
-                          ? "bg-green-500/20 text-green-500"
+                    <div className="flex flex-col md:items-end">
+                      <Badge
+                        variant="secondary"
+                        className={
+                          bounty.status === "active"
+                            ? "bg-green-500/20 text-green-500"
+                            : bounty.status === "in-review"
+                              ? "bg-yellow-500/20 text-yellow-500"
+                              : "bg-blue-500/20 text-blue-500"
+                        }
+                      >
+                        {bounty.status === "active"
+                          ? "Active"
                           : bounty.status === "in-review"
-                            ? "bg-yellow-500/20 text-yellow-500"
-                            : "bg-blue-500/20 text-blue-500"
-                      }
-                    >
-                      {bounty.status === "active"
-                        ? "Active"
-                        : bounty.status === "in-review"
-                          ? "In Review"
-                          : "Completed"}
-                    </Badge>
-                  </div>
+                            ? "In Review"
+                            : "Completed"}
+                      </Badge>
 
-                  {bounty.status === "active" && activeAccount && (
-                    <Button
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        router.push(`/bounty/${bounty.id}/apply`)
-                      }}
-                      className="bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white w-full md:w-auto mt-4 md:mt-0"
-                    >
-                      Apply for Bounty
-                    </Button>
-                  )}
+                      {bounty.status === "active" && activeAccount && (
+                        <Button
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            router.push(`/bounty/${bounty.appId}/apply`)
+                          }}
+                          className="bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white w-full md:w-auto mt-4"
+                        >
+                          Apply for Bounty
+                        </Button>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
